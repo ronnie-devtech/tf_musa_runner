@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import re
@@ -27,7 +28,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MUSA_PLUGIN_PATH = (
     SCRIPT_DIR / ".." / "tensorflow_musa_extension" / "build" / "libmusa_plugin.so"
 ).resolve()
-
+GRAPH_DUMP_ENV = "MUSA_DUMP_GRAPHDEF"
+GRAPH_DUMP_DIR_ENV = "MUSA_DUMP_GRAPHDEF_DIR"
+GRAPH_DUMP_STAGE_SUFFIXES = {
+    "after_default_grappler_before_musa_optimizer": "initial",
+    "after_custom_fusion_pattern": "after_fusion",
+    "final_after_all_musa_passes": "final",
+}
 
 # ==========================================
 # 1. 加载 MUSA 插件
@@ -37,10 +44,77 @@ def load_musa_plugin(plugin_path: Path):
         try:
             tf.load_op_library(str(plugin_path))
             print(f">>>> [MUSA] Plugin loaded successfully from: {plugin_path}")
+            return True
         except Exception as e:
             print(f"!!!! [MUSA] Failed to load plugin: {e}")
     else:
         print(f"[Error] MUSA Plugin({plugin_path}) not found.")
+    return False
+
+def env_flag_enabled(name):
+    value = os.environ.get(name, "")
+    return value in ("1", "true", "TRUE", "yes")
+
+def create_musa_dump_session_config(enable_musa_optimizer: bool):
+    if not enable_musa_optimizer:
+        return None
+
+    config = tf.compat.v1.ConfigProto()
+    config.allow_soft_placement = True
+
+    rewrite_options = config.graph_options.rewrite_options
+    rewrite_options.min_graph_nodes = -1
+    custom_optimizer = rewrite_options.custom_optimizers.add()
+    custom_optimizer.name = "musa_graph_optimizer"
+    rewrite_options.optimizers.extend(["musa_graph_optimizer"])
+    return config
+
+def collect_graph_dump_files(dump_dir: Union[str, Path, None]):
+    if not dump_dir:
+        return {}
+
+    dump_root = Path(dump_dir)
+    if not dump_root.exists():
+        return {}
+
+    files = {}
+    for alias, stage_suffix in GRAPH_DUMP_STAGE_SUFFIXES.items():
+        matches = []
+        for ext in (".pbtxt", ".pb"):
+            matches.extend(dump_root.glob(f"*_{stage_suffix}{ext}"))
+        matches = sorted(matches, key=lambda path: (path.stat().st_mtime, str(path)))
+        if matches:
+            latest = matches[-1]
+            files[alias] = {
+                "stage": stage_suffix,
+                "format": latest.suffix.lstrip("."),
+                "path": str(latest.resolve()),
+            }
+    return files
+
+@contextmanager
+def configured_graph_dump_dir(default_dump_dir: Union[Path, None]):
+    if not env_flag_enabled(GRAPH_DUMP_ENV):
+        yield None
+        return
+
+    old_dump_dir = os.environ.get(GRAPH_DUMP_DIR_ENV)
+    if old_dump_dir:
+        dump_dir = Path(old_dump_dir).resolve()
+    elif default_dump_dir is not None:
+        dump_dir = Path(default_dump_dir).resolve()
+        os.environ[GRAPH_DUMP_DIR_ENV] = str(dump_dir)
+    else:
+        dump_dir = Path.cwd().resolve()
+
+    dump_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        yield dump_dir
+    finally:
+        if old_dump_dir is None:
+            os.environ.pop(GRAPH_DUMP_DIR_ENV, None)
+
 
 def load_meta(spec_path: Path):
     meta = tf.compat.v1.MetaGraphDef()
@@ -277,7 +351,7 @@ def extract_core_error(stack: Union[str, None]):
     return lines[-1] if lines else None
 
 
-def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int):
+def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: bool, runner_out: Path):
     meta = load_meta(spec_path)
     input_spec = read_node_list_collection(meta, "input_spec")
     output_spec = read_node_list_collection(meta, "output_spec")
@@ -324,21 +398,44 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int):
             if tensor.op.type in ("Placeholder", "PlaceholderWithDefault"):
                 value = random_array(run_shape, tensor.dtype.as_numpy_dtype, rng)
                 feed_dict[tensor] = value
+        ### musa dump
+        graph_dump = {
+            "enabled": env_flag_enabled(GRAPH_DUMP_ENV),
+            "plugin_loaded": musa_loaded,
+            "optimizer_enabled": False,
+            "dump_dir": None,
+            "files": {},
+        }
 
-        session_config = tf.compat.v1.ConfigProto()
-        session_config.allow_soft_placement = bool(args.allow_soft_placement)
-        session_config.log_device_placement = bool(args.log_device_placement)
-        with tf.compat.v1.Session(graph=graph, config=session_config) as sess:
-            try:
-                for _ in range(max(0, args.warmup)):
-                    sess.run(outputs, feed_dict=feed_dict)
-                for _ in range(max(1, args.run_iters)):
-                    t0 = time.perf_counter()
-                    last_vals = sess.run(outputs, feed_dict=feed_dict)
-                    t1 = time.perf_counter()
-                    lat_ms.append((t1 - t0) * 1000.0)
-            except Exception:
-                run_error = traceback.format_exc()
+        enable_musa_optimizer = musa_loaded and graph_dump["enabled"]
+        default_dump_dir = None
+
+        if enable_musa_optimizer:   # dump
+            session_config = create_musa_dump_session_config(enable_musa_optimizer=True)
+            graph_dump["optimizer_enabled"] = True
+            default_dump_dir = (runner_out / f"{spec_path.stem}_bs_{bs}").resolve()
+        else:   # inference
+            session_config = tf.compat.v1.ConfigProto()
+            session_config.allow_soft_placement = bool(args.allow_soft_placement)
+            session_config.log_device_placement = bool(args.log_device_placement)
+
+        with configured_graph_dump_dir(default_dump_dir) as active_dump_dir:
+            if active_dump_dir is not None:
+                graph_dump["dump_dir"] = str(active_dump_dir)    
+            with tf.compat.v1.Session(graph=graph, config=session_config) as sess:
+                try:
+                    for _ in range(max(0, args.warmup)):
+                        sess.run(outputs, feed_dict=feed_dict)
+                    for _ in range(max(1, args.run_iters)):
+                        t0 = time.perf_counter()
+                        last_vals = sess.run(outputs, feed_dict=feed_dict)
+                        t1 = time.perf_counter()
+                        lat_ms.append((t1 - t0) * 1000.0)
+                except Exception:
+                    run_error = traceback.format_exc()
+
+        if graph_dump["dump_dir"]:
+            graph_dump["files"] = collect_graph_dump_files(graph_dump["dump_dir"])
 
     return {
         "spec_path": str(spec_path),
@@ -349,6 +446,7 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int):
         "status": "ok" if run_error is None else "failed",
         "error_core": extract_core_error(run_error),
         "error": run_error,
+        "graph_dump": graph_dump,
         "timing_ms": {
             "warmup": max(0, args.warmup),
             "run_iters": max(1, args.run_iters),
@@ -446,13 +544,14 @@ def main():
     if not convert_script.exists():
         raise FileNotFoundError(f"convert script not found: {convert_script}")
     if args.device and "MUSA" in str(args.device).upper():
-        load_musa_plugin(Path(args.musa_plugin).resolve() if args.musa_plugin else DEFAULT_MUSA_PLUGIN_PATH)
+        musa_loaded = load_musa_plugin(Path(args.musa_plugin).resolve() if args.musa_plugin else DEFAULT_MUSA_PLUGIN_PATH)
         musa_devices = tf.config.list_physical_devices("MUSA")
         if not musa_devices:
             raise RuntimeError(
                 f"requested device {args.device}, but no MUSA devices are visible"
             )
     else:
+        musa_loaded = False
         print("[Info] MUSA Plugin loading skipped. Running on CPU.")
 
     specs = collect_specs(args.spec, args.spec_dir)
@@ -493,13 +592,17 @@ def main():
 
         try:
             for bs in bs_values:
-                one_report = run_single_spec(spec_path.resolve(), pb_path.resolve(), args, bs)
+                one_report = run_single_spec(spec_path.resolve(), pb_path.resolve(), args, bs, musa_loaded, auto_pb_root)
                 if one_report["status"] != "ok":
                     failures += 1
                 all_reports.append(one_report)
                 print(f"[INFO] run done: spec={spec_path.name} bs={bs} status={one_report['status']}")
                 if one_report.get("error_core"):
                     print(f"[INFO] core error: {one_report['error_core']}")
+                dump_files = (one_report.get("graph_dump") or {}).get("files") or {}
+                if dump_files:
+                    for alias, info in dump_files.items():
+                        print(f"[INFO] graph dump {alias}: {info['path']}")
         except Exception:
             err = traceback.format_exc()
             failures += 1
