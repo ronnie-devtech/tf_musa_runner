@@ -408,15 +408,20 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: 
             "files": {},
         }
 
-        enable_musa_optimizer = musa_loaded
+        enable_musa_optimizer = musa_loaded and args.musa_optimizer
         default_dump_dir = None
-        session_config = None
         
-        if enable_musa_optimizer:   # dump
+        if enable_musa_optimizer:   # enable musa custom optimizer
+            print("[INFO] Enable MUSA Custom Optimizer")
             session_config = create_musa_dump_session_config(enable_musa_optimizer=True, allow_soft_placement=bool(args.allow_soft_placement), log_device_placement=bool(args.log_device_placement))
             graph_dump["optimizer_enabled"] = True
-            if graph_dump["enabled"]:
+            if graph_dump["enabled"]:   # dump
                 default_dump_dir = (runner_out / f"{spec_path.stem}_bs_{bs}").resolve()
+        else:   # disable musa optimizer
+            print("[INFO] Disable MUSA Custom Optimizer")
+            session_config = tf.compat.v1.ConfigProto()
+            session_config.allow_soft_placement = bool(args.allow_soft_placement)
+            session_config.log_device_placement = bool(args.log_device_placement)
 
         with configured_graph_dump_dir(default_dump_dir) as active_dump_dir:
             if active_dump_dir is not None:
@@ -521,6 +526,7 @@ def main():
     parser.add_argument("--device", default="/device:MUSA:0", choices=["/device:MUSA:0", "/device:CPU:0"], help="Device scope for imported graph, e.g. /device:MUSA:0 or /CPU:0.")
     parser.add_argument("--allow_soft_placement", type=parse_bool, default=True, help="Whether TensorFlow can place unsupported ops on other devices.")
     parser.add_argument("--log_device_placement", type=parse_bool, default=False, help="Print TensorFlow op placement logs.")
+    parser.add_argument("--musa_optimizer", type=parse_bool, default=True, help="enable to MUSA Custom Optimizer.")
     parser.add_argument("--convert_script", default="convert_spec_to_pb.py", help="Path to convert spec->pb script.")
     parser.add_argument(
     "--musa-plugin",
