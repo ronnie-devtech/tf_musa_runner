@@ -55,12 +55,13 @@ def env_flag_enabled(name):
     value = os.environ.get(name, "")
     return value in ("1", "true", "TRUE", "yes")
 
-def create_musa_dump_session_config(enable_musa_optimizer: bool):
+def create_musa_dump_session_config(enable_musa_optimizer: bool, allow_soft_placement: bool, log_device_placement: bool):
     if not enable_musa_optimizer:
         return None
 
     config = tf.compat.v1.ConfigProto()
-    config.allow_soft_placement = True
+    config.allow_soft_placement = allow_soft_placement
+    config.log_device_placement = log_device_placement
 
     rewrite_options = config.graph_options.rewrite_options
     rewrite_options.min_graph_nodes = -1
@@ -407,17 +408,15 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: 
             "files": {},
         }
 
-        enable_musa_optimizer = musa_loaded and graph_dump["enabled"]
+        enable_musa_optimizer = musa_loaded
         default_dump_dir = None
-
+        session_config = None
+        
         if enable_musa_optimizer:   # dump
-            session_config = create_musa_dump_session_config(enable_musa_optimizer=True)
+            session_config = create_musa_dump_session_config(enable_musa_optimizer=True, allow_soft_placement=bool(args.allow_soft_placement), log_device_placement=bool(args.log_device_placement))
             graph_dump["optimizer_enabled"] = True
-            default_dump_dir = (runner_out / f"{spec_path.stem}_bs_{bs}").resolve()
-        else:   # inference
-            session_config = tf.compat.v1.ConfigProto()
-            session_config.allow_soft_placement = bool(args.allow_soft_placement)
-            session_config.log_device_placement = bool(args.log_device_placement)
+            if graph_dump["enabled"]:
+                default_dump_dir = (runner_out / f"{spec_path.stem}_bs_{bs}").resolve()
 
         with configured_graph_dump_dir(default_dump_dir) as active_dump_dir:
             if active_dump_dir is not None:
