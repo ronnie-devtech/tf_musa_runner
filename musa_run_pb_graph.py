@@ -64,10 +64,8 @@ def create_musa_dump_session_config(enable_musa_optimizer: bool, allow_soft_plac
     config.log_device_placement = log_device_placement
 
     rewrite_options = config.graph_options.rewrite_options
-    rewrite_options.min_graph_nodes = -1
     custom_optimizer = rewrite_options.custom_optimizers.add()
     custom_optimizer.name = "musa_graph_optimizer"
-    rewrite_options.optimizers.extend(["musa_graph_optimizer"])
     return config
 
 def collect_graph_dump_files(dump_dir: Union[str, Path, None]):
