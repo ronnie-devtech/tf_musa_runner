@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
 from contextlib import contextmanager
 import json
 import os
@@ -226,6 +227,71 @@ def random_array(shape, np_dtype, rng):
     raise TypeError(f"Unsupported dtype for random input: {np_dtype}")
 
 
+class PinnedHostArray:
+    _lib = None
+
+    @classmethod
+    def lib(cls):
+        if cls._lib is None:
+            cls._lib = ctypes.CDLL("/usr/local/musa/lib/libmusart.so")
+            cls._lib.musaHostAlloc.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            cls._lib.musaHostAlloc.restype = ctypes.c_int
+            cls._lib.musaFreeHost.argtypes = [ctypes.c_void_p]
+            cls._lib.musaFreeHost.restype = ctypes.c_int
+        return cls._lib
+
+    def __init__(self, shape, np_dtype):
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(np_dtype)
+        count = int(np.prod(self.shape)) if self.shape else 1
+        self.nbytes = max(1, count * self.dtype.itemsize)
+        self.ptr = ctypes.c_void_p()
+        err = self.lib().musaHostAlloc(ctypes.byref(self.ptr), self.nbytes, 0)
+        if err != 0 or not self.ptr.value:
+            raise RuntimeError(f"musaHostAlloc failed: err={err}, bytes={self.nbytes}")
+        buf_type = ctypes.c_char * self.nbytes
+        self.buffer = buf_type.from_address(self.ptr.value)
+        self.array = np.ndarray(shape=self.shape, dtype=self.dtype, buffer=self.buffer)
+
+    def __del__(self):
+        ptr = getattr(self, "ptr", None)
+        if ptr is not None and ptr.value:
+            try:
+                self.lib().musaFreeHost(ptr)
+            except Exception:
+                pass
+            self.ptr = ctypes.c_void_p()
+
+
+def pinned_random_array(shape, np_dtype, rng, holders):
+    if np_dtype in (np.str_, np.object_, np.bytes_, object):
+        return random_array(shape, np_dtype, rng)
+
+    holder = PinnedHostArray(shape, np_dtype)
+    arr = holder.array
+    holders.append(holder)
+
+    if np.issubdtype(arr.dtype, np.floating):
+        arr[...] = rng.uniform(0.1, 1.0, size=shape).astype(arr.dtype, copy=False)
+        return arr
+    if np.issubdtype(arr.dtype, np.complexfloating):
+        real = rng.standard_normal(size=shape)
+        imag = rng.standard_normal(size=shape)
+        arr[...] = (real + 1j * imag).astype(arr.dtype, copy=False)
+        return arr
+    if np.issubdtype(arr.dtype, np.integer):
+        arr[...] = rng.integers(0, 10, size=shape, dtype=arr.dtype)
+        return arr
+    if np.issubdtype(arr.dtype, np.bool_):
+        arr[...] = rng.choice([False, True], size=shape)
+        return arr
+    raise TypeError(f"Unsupported dtype for pinned random input: {np_dtype}")
+
+
 def percentile(arr, q):
     if not arr:
         return 0.0
@@ -349,6 +415,14 @@ def extract_core_error(stack: Union[str, None]):
         return ln
     return lines[-1] if lines else None
 
+def trimmed_mean(lat_ms, trim_ratio=0.1):
+    if not lat_ms:
+        return 0.0
+    arr = sorted(lat_ms)
+    n = len(arr)
+    k = int(n * trim_ratio)
+    trimmed = arr[k:n-k] if n > 2*k else arr
+    return float(np.mean(trimmed))
 
 def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: bool, runner_out: Path):
     meta = load_meta(spec_path)
@@ -379,6 +453,8 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: 
         rng = np.random.default_rng(args.seed)
         inputs = []
         feed_dict = {}
+        pinned_feed_holders = []
+        use_pinned_feed = env_flag_enabled("MUSA_PINNED_FEED")
         for name in input_spec:
             tensor = graph.get_tensor_by_name(name)
             tensor_shape = safe_shape(tensor)
@@ -395,7 +471,12 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: 
                         merged_shape[dim_idx] = min_dim
             run_shape = resolve_shape(merged_shape, bs, args.unknown_dim)
             if tensor.op.type in ("Placeholder", "PlaceholderWithDefault"):
-                value = random_array(run_shape, tensor.dtype.as_numpy_dtype, rng)
+                if use_pinned_feed:
+                    value = pinned_random_array(
+                        run_shape, tensor.dtype.as_numpy_dtype, rng, pinned_feed_holders
+                    )
+                else:
+                    value = random_array(run_shape, tensor.dtype.as_numpy_dtype, rng)
                 feed_dict[tensor] = value
         ### musa dump
         graph_dump = {
@@ -453,6 +534,7 @@ def run_single_spec(spec_path: Path, pb_path: Path, args, bs: int, musa_loaded: 
             "warmup": max(0, args.warmup),
             "run_iters": max(1, args.run_iters),
             "average": float(np.mean(lat_ms)) if lat_ms else 0.0,
+            "trimmed_avg": trimmed_mean(lat_ms, 0.1),
             "min": float(np.min(lat_ms)) if lat_ms else 0.0,
             "max": float(np.max(lat_ms)) if lat_ms else 0.0,
             "p50": percentile(lat_ms, 50),
@@ -641,11 +723,12 @@ def main():
                 "batch_size": r.get("batch_size"),
                 "status": r.get("status"),
                 "average_time_ms": timing.get("average"),
+                "trimmed_avg_ms": timing.get("trimmed_avg"),
                 "timing_ms": timing,
                 "error_core": r.get("error_core"),
             }
         )
-        latency_summary.append({"batch_size": r.get("batch_size"), "average_time_ms": timing.get("average")})
+        latency_summary.append({"batch_size": r.get("batch_size"), "average_time_ms": timing.get("average"), "trimmed_avg_ms": timing.get("trimmed_avg"),})
     avg_time_summary.sort(
         key=lambda x: (
             str(x.get("pb_path") or ""),
