@@ -2,7 +2,6 @@
 set -uo pipefail
 
 DEFAULT_SPEC="./meta_graph/meta_graph_3.spec"
-DEFAULT_MUSA_PLUGIN="../tensorflow_musa_extension/build/libmusa_plugin.so"
 DEFAULT_DEVICE="0"
 DEFAULT_RUNNER_SCRIPT="./musa_run_pb_graph.py"
 DEFAULT_WORKDIR="."
@@ -23,7 +22,6 @@ Options:
   --no-averge, --no-average
                            Disable repeat average output
   --spec PATH              Default: ./meta_graph/meta_graph_3.spec
-  --musa-plugin PATH       Default: ../tensorflow_musa_extension/build/libmusa_plugin.so
   --device ID              Default: 0
   --runner-script PATH     Default: ./musa_run_pb_graph.py
   --workdir PATH           Default: current directory
@@ -34,7 +32,6 @@ EOF
 MODE=""
 SINGLE_BS=""
 SPEC="$DEFAULT_SPEC"
-MUSA_PLUGIN="$DEFAULT_MUSA_PLUGIN"
 DEVICE="$DEFAULT_DEVICE"
 RUNNER_SCRIPT="$DEFAULT_RUNNER_SCRIPT"
 WORKDIR="$DEFAULT_WORKDIR"
@@ -73,10 +70,6 @@ while [[ $# -gt 0 ]]; do
     --no-averge|--no-average)
       AVERAGE_ENABLED="0"
       shift
-      ;;
-    --musa-plugin)
-      MUSA_PLUGIN="${2:-}"
-      shift 2
       ;;
     --device)
       DEVICE="${2:-}"
@@ -218,12 +211,12 @@ for bs in "${BATCH_SIZES[@]}"; do
 
     if (
       cd "$WORKDIR" && \
+      MUSA_ENABLE_TF32=0 \
       MUSA_PINNED_FEED=1 \
       MUSA_PINNED_H2D_ON_COMPUTE_STREAM=1 \
       MUSA_VISIBLE_DEVICES="$DEVICE" \
       python3 "$RUNNER_SCRIPT" \
         --spec "$SPEC" \
-        --musa-plugin "$MUSA_PLUGIN" \
         --bs "$bs" \
         --run_iters 20 \
         >"$tmp_log" 2>&1

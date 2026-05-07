@@ -26,9 +26,6 @@ tf.config.run_functions_eagerly(True)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MUSA_PLUGIN_PATH = (
-    SCRIPT_DIR / ".." / "tensorflow_musa_extension" / "build" / "libmusa_plugin.so"
-).resolve()
 GRAPH_DUMP_ENV = "MUSA_DUMP_GRAPHDEF"
 GRAPH_DUMP_DIR_ENV = "MUSA_DUMP_GRAPHDEF_DIR"
 GRAPH_DUMP_STAGE_SUFFIXES = {
@@ -37,20 +34,6 @@ GRAPH_DUMP_STAGE_SUFFIXES = {
     "final_after_all_musa_passes": "final",
 }
 
-# ==========================================
-# 1. 加载 MUSA 插件
-# ==========================================
-def load_musa_plugin(plugin_path: Path):
-    if plugin_path.exists():
-        try:
-            tf.load_op_library(str(plugin_path))
-            print(f">>>> [MUSA] Plugin loaded successfully from: {plugin_path}")
-            return True
-        except Exception as e:
-            print(f"!!!! [MUSA] Failed to load plugin: {e}")
-    else:
-        print(f"[Error] MUSA Plugin({plugin_path}) not found.")
-    return False
 
 def env_flag_enabled(name):
     value = os.environ.get(name, "")
@@ -608,12 +591,6 @@ def main():
     parser.add_argument("--log_device_placement", type=parse_bool, default=False, help="Print TensorFlow op placement logs.")
     parser.add_argument("--musa_optimizer", type=parse_bool, default=True, help="enable to MUSA Custom Optimizer.")
     parser.add_argument("--convert_script", default="convert_spec_to_pb.py", help="Path to convert spec->pb script.")
-    parser.add_argument(
-    "--musa-plugin",
-    type=str,
-    default=None,
-    help="Path to MUSA plugin library",
-    )
 
     args = parser.parse_args()
 
@@ -629,7 +606,14 @@ def main():
     if not convert_script.exists():
         raise FileNotFoundError(f"convert script not found: {convert_script}")
     if args.device and "MUSA" in str(args.device).upper():
-        musa_loaded = load_musa_plugin(Path(args.musa_plugin).resolve() if args.musa_plugin else DEFAULT_MUSA_PLUGIN_PATH)
+        try:
+            import tensorflow_musa  # noqa: F401
+        except ImportError as e:
+            print(f"!!!! [MUSA] Failed to import tensorflow_musa: {e}")
+            print("请先构建并安装 tensorflow_musa wheel 后再运行 MUSA 推理")
+            return 1
+        print(">>>> [MUSA] Plugin loaded by importing tensorflow_musa")
+        musa_loaded = True
         musa_devices = tf.config.list_physical_devices("MUSA")
         if not musa_devices:
             raise RuntimeError(
@@ -759,7 +743,6 @@ if __name__ == "__main__":
     main()
 '''
 示例用法:
-  # 在 MUSA 设备上运行
-  python musa_run_pb_graph.py --spec /path/to/*.spec --bs 4096
+    bash graph_runner.sh --spec ./meta_graph/meta_graph_3.spec --single 1024 
 
   '''

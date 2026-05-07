@@ -5,10 +5,7 @@
 ### 运行 Graph / MetaGraph
 
 ```bash
-python musa_run_pb_graph.py \
-  --spec ./meta_graph/meta_graph_1.spec \
-  --bs 32 \
-  --musa-plugin /path/to/your/libmusa_plugin.so
+bash graph_runner.sh --spec ./meta_graph/meta_graph_3.spec --single 1024 
 ```
 ---
 
